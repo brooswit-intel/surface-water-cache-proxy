@@ -46,6 +46,34 @@ ATTRIBUTION = (
     "Nature 540, 418-422), Copernicus Programme"
 )
 
+# The fixed, allowlisted origin: exactly scheme+host+base path, nothing else.
+_ALLOWED_SCHEME = "https"
+_ALLOWED_HOST = "storage.googleapis.com"
+_ALLOWED_PATH_PREFIX = "/global-surface-water/downloads2021/occurrence/"
+
+# A representative file independently confirmed present upstream (read-only
+# bytes=0-7 probe against the real bucket, 2026-11-24, HTTP 206) - used as the
+# dedicated health-check target so a probe doesn't depend on any one square a
+# world actually visits. Not cached; never written to the data cache.
+DEFAULT_HEALTH_CHECK_FILE = "occurrence_0E_50Nv1_4_2021.tif"
+
+
+def _validate_production_upstream(url: str) -> str:
+    """Enforces the fixed-HTTPS-allowlisted-origin requirement on the upstream
+    actually used in production (read from SURFACE_WATER_CACHE_UPSTREAM). Direct
+    constructor injection of upstream_base is test-only and bypasses this check
+    on purpose, so unit tests can still point at a local loopback mock."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != _ALLOWED_SCHEME:
+        raise ValueError(f"Surface water upstream must be {_ALLOWED_SCHEME}://, got {parsed.scheme!r} in {url!r}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f"Surface water upstream must not carry userinfo: {url!r}")
+    if parsed.hostname != _ALLOWED_HOST or parsed.port is not None:
+        raise ValueError(f"Surface water upstream host must be exactly {_ALLOWED_HOST}, got {url!r}")
+    if not parsed.path.startswith(_ALLOWED_PATH_PREFIX):
+        raise ValueError(f"Surface water upstream path must start with {_ALLOWED_PATH_PREFIX!r}, got {url!r}")
+    return url
+
 # occurrence_{lon}{E|W}_{lat}{N|S}v1_4_2021.tif - matches SurfaceWaterSource.name().
 _FILENAME_RE = re.compile(r"^occurrence_(\d{1,3})([EW])_(\d{1,2})([NS])v1_4_2021\.tif$")
 
@@ -92,29 +120,77 @@ def _parse_range(range_header: str | None) -> tuple[int, int] | None:
 
 @dataclass
 class Stats:
+    """Data-cache observability. Every actual network attempt to upstream is
+    counted here with its outcome, bytes and latency - not just the ones that
+    end in a successful fill - per the explicit observability requirement
+    (MINECRAFT-573 review finding: upstream_requests previously counted only
+    successful fills, omitting 404/403/failed-retry attempts and latency).
+    Health-check probes are tracked in their own distinct counters below and
+    never touch any of these cache_*/upstream_* fields, so a health probe can
+    never be mistaken for real cache or data-fetch activity."""
+
     cache_hits: int = 0
     cache_misses: int = 0
-    upstream_requests: int = 0
-    bytes_downloaded: int = 0
     not_modified: int = 0
     evictions: int = 0
-    missing_files: int = 0
-    forbidden: int = 0
-    failures: int = 0
+    missing_files: int = 0  # genuine 404s, cached as absence
+
+    # Every real HTTP attempt made to upstream (each retry counts once), by outcome.
+    upstream_attempts: int = 0
+    upstream_fills: int = 0        # attempt resulted in valid, usable data
+    upstream_missing: int = 0      # attempt resulted in a genuine 404
+    upstream_forbidden: int = 0    # attempt resulted in a 403
+    upstream_failed: int = 0       # attempt resulted in any other failure (5xx, mismatch, truncated, network error)
+    upstream_bytes: int = 0        # bytes actually received across all attempts, any outcome
+    upstream_latency_ms_total: float = 0.0
+
+    # Health-check probes: deliberately separate from everything above.
+    health_checks_total: int = 0
+    health_checks_healthy: int = 0
+    health_checks_unhealthy: int = 0
+
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def record_attempt(self, outcome: str, nbytes: int, latency_ms: float) -> None:
+        with self.lock:
+            self.upstream_attempts += 1
+            self.upstream_bytes += nbytes
+            self.upstream_latency_ms_total += latency_ms
+            if outcome == "success":
+                self.upstream_fills += 1
+            elif outcome == "missing":
+                self.upstream_missing += 1
+            elif outcome == "forbidden":
+                self.upstream_forbidden += 1
+            else:
+                self.upstream_failed += 1
+
+    def record_health_check(self, healthy: bool) -> None:
+        with self.lock:
+            self.health_checks_total += 1
+            if healthy:
+                self.health_checks_healthy += 1
+            else:
+                self.health_checks_unhealthy += 1
 
     def as_dict(self) -> dict:
         with self.lock:
             return {
                 "cache_hits": self.cache_hits,
                 "cache_misses": self.cache_misses,
-                "upstream_requests": self.upstream_requests,
-                "bytes_downloaded": self.bytes_downloaded,
                 "not_modified": self.not_modified,
                 "evictions": self.evictions,
                 "missing_files": self.missing_files,
-                "forbidden": self.forbidden,
-                "failures": self.failures,
+                "upstream_attempts": self.upstream_attempts,
+                "upstream_fills": self.upstream_fills,
+                "upstream_missing": self.upstream_missing,
+                "upstream_forbidden": self.upstream_forbidden,
+                "upstream_failed": self.upstream_failed,
+                "upstream_bytes": self.upstream_bytes,
+                "upstream_latency_ms_total": self.upstream_latency_ms_total,
+                "health_checks_total": self.health_checks_total,
+                "health_checks_healthy": self.health_checks_healthy,
+                "health_checks_unhealthy": self.health_checks_unhealthy,
             }
 
 
@@ -262,13 +338,15 @@ def _content_range_matches(header: str | None, start: int, end: int) -> bool:
 
 
 def fetch_upstream_range(upstream_base: str, file_path: str, start: int, end: int,
-                          timeout: float = 15.0, retries: int = 3) -> bytes:
+                          stats: "Stats | None" = None, timeout: float = 15.0, retries: int = 3) -> bytes:
     """Byte-range GET against the allowlisted upstream, matching RangeFiles.transfer():
     fixed retries with backoff; 404 raises UpstreamMissing (genuine absence, cacheable);
     403 raises UpstreamForbidden (never cached, never silently treated as absence);
     any other non-2xx, a dropped connection, or a body that doesn't match the
     requested/declared length is a transient failure, retried, then raised as
-    UpstreamError - never returned as if it were data."""
+    UpstreamError - never returned as if it were data. Every real attempt - any
+    outcome - is recorded on `stats` (bytes received and wall-clock latency), not
+    just the final successful one."""
     parsed = urllib.parse.urlsplit(upstream_base)
     full_path = parsed.path.rstrip("/") + "/" + file_path
     want = end - start + 1
@@ -278,6 +356,7 @@ def fetch_upstream_range(upstream_base: str, file_path: str, start: int, end: in
             time.sleep(0.05 * (2 ** attempt))
         conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
         conn = conn_cls(parsed.netloc, timeout=timeout)
+        started = time.monotonic()
         try:
             conn.request(
                 "GET", full_path,
@@ -288,20 +367,31 @@ def fetch_upstream_range(upstream_base: str, file_path: str, start: int, end: in
             )
             resp = conn.getresponse()
             body = resp.read()
+            latency_ms = (time.monotonic() - started) * 1000
             if resp.status == 404:
+                if stats is not None:
+                    stats.record_attempt("missing", len(body), latency_ms)
                 raise UpstreamMissing(f"HTTP 404 for {full_path}")
             if resp.status == 403:
+                if stats is not None:
+                    stats.record_attempt("forbidden", len(body), latency_ms)
                 raise UpstreamForbidden(f"HTTP 403 for {full_path}")
             if resp.status not in (200, 206):
+                if stats is not None:
+                    stats.record_attempt("failed", len(body), latency_ms)
                 last_exc = UpstreamError(f"HTTP {resp.status} for {full_path}")
                 continue
             declared = resp.getheader("Content-Length")
             if declared is not None and int(declared) != len(body):
+                if stats is not None:
+                    stats.record_attempt("failed", len(body), latency_ms)
                 last_exc = UpstreamError(
                     f"truncated transfer for {full_path}: declared {declared}, got {len(body)}"
                 )
                 continue
             if resp.status == 206 and not _content_range_matches(resp.getheader("Content-Range"), start, end):
+                if stats is not None:
+                    stats.record_attempt("failed", len(body), latency_ms)
                 last_exc = UpstreamError(
                     f"Content-Range mismatch for {full_path}: wanted bytes {start}-{end}, "
                     f"got {resp.getheader('Content-Range')!r}"
@@ -312,14 +402,20 @@ def fetch_upstream_range(upstream_base: str, file_path: str, start: int, end: in
                 # locally, exactly like RangeFiles.transfer() does for the Java client.
                 body = body[start:start + want]
             if len(body) != want:
+                if stats is not None:
+                    stats.record_attempt("failed", len(body), latency_ms)
                 last_exc = UpstreamError(
                     f"short range body for {full_path}: wanted {want} bytes, got {len(body)}"
                 )
                 continue
+            if stats is not None:
+                stats.record_attempt("success", len(body), latency_ms)
             return body
         except (UpstreamMissing, UpstreamForbidden):
             raise
         except OSError as net_err:
+            if stats is not None:
+                stats.record_attempt("failed", 0, (time.monotonic() - started) * 1000)
             last_exc = net_err
             continue
         finally:
@@ -365,35 +461,55 @@ class _SingleFlight:
 
 
 class SurfaceWaterCacheProxy:
-    def __init__(self, db_path: str, upstream_base: str | None = None, max_bytes: int = 512 * 1024 * 1024):
-        self.upstream_base = upstream_base or os.environ.get(
-            "SURFACE_WATER_CACHE_UPSTREAM", DEFAULT_UPSTREAM
-        )
+    def __init__(self, db_path: str, upstream_base: str | None = None, max_bytes: int = 512 * 1024 * 1024,
+                 health_check_file: str | None = None):
+        if upstream_base is not None:
+            # Direct constructor injection: test-only local mock, deliberately not
+            # run through the production allowlist below.
+            self.upstream_base = upstream_base
+        else:
+            self.upstream_base = _validate_production_upstream(
+                os.environ.get("SURFACE_WATER_CACHE_UPSTREAM", DEFAULT_UPSTREAM)
+            )
+        self.health_check_file = health_check_file or DEFAULT_HEALTH_CHECK_FILE
         self.cache = RangeCache(db_path, max_bytes)
         self.stats = Stats()
         self._single_flight = _SingleFlight()
 
     def health_check(self) -> tuple[bool, str]:
-        """TTL 0: a fresh, live reachability probe of the allowlisted upstream on
-        every call - never reads or writes the data cache (per John's cache-lifetime
-        decision on MINECRAFT-571, 2026-11-24: validated data has no time-based
-        expiry, but the health endpoint is TTL 0 only and does no data cache I/O).
-        A tiny bytes=0-0 range request against the upstream base itself, so this
-        never depends on any one data square existing - any HTTP response at all
-        (200/206/403/404) proves the host is reachable; only a connection failure
-        or timeout means unhealthy."""
+        """TTL 0: a fresh, live probe of the allowlisted upstream on every call -
+        never reads or writes the data cache, and never touches cache_hits/misses
+        or upstream_attempts/fills/etc (per John's cache-lifetime decision on
+        MINECRAFT-571 and the exact-200-only correction on MINECRAFT-580/571
+        comment 55734/55737/55791). A bytes=0-7 range request against a fixed,
+        independently-confirmed-present representative file - a provider-valid
+        probe, not the bare base path (which is not itself a real resource and
+        would answer 403 on a listing-disabled bucket, telling us nothing).
+        Healthy means exactly HTTP 206 with a body; 403/404/5xx/any other status,
+        a mismatched/short body, or a connection failure are all unhealthy - this
+        never silently treats a wrong-route or access rejection as green."""
         parsed = urllib.parse.urlsplit(self.upstream_base)
+        full_path = parsed.path.rstrip("/") + "/" + self.health_check_file
         conn_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
         conn = conn_cls(parsed.netloc, timeout=5.0)
         try:
-            conn.request("GET", parsed.path, headers={
+            conn.request("GET", full_path, headers={
                 "User-Agent": "earth-platform-surface-water-cache/1",
-                "Range": "bytes=0-0",
+                "Range": "bytes=0-7",
             })
             resp = conn.getresponse()
-            resp.read()
-            return True, f"reachable (HTTP {resp.status})"
+            body = resp.read()
+            healthy = (
+                resp.status == 206
+                and len(body) == 8
+                and _content_range_matches(resp.getheader("Content-Range"), 0, 7)
+            )
+            self.stats.record_health_check(healthy)
+            if healthy:
+                return True, "reachable (HTTP 206, representative probe matched)"
+            return False, f"unhealthy: HTTP {resp.status}, body {len(body)} bytes, Content-Range {resp.getheader('Content-Range')!r}"
         except OSError as net_err:
+            self.stats.record_health_check(False)
             return False, f"unreachable: {net_err}"
         finally:
             conn.close()
@@ -421,15 +537,12 @@ class SurfaceWaterCacheProxy:
         if cached is None:
             def load():
                 try:
-                    body = fetch_upstream_range(self.upstream_base, file_path, start, end)
+                    body = fetch_upstream_range(self.upstream_base, file_path, start, end, stats=self.stats)
                 except UpstreamMissing:
                     with self.stats.lock:
                         self.stats.missing_files += 1
                     self.cache.put(file_path, start, end, None)
                     return _MISSING, self.cache.get(file_path, start, end)[1]
-                with self.stats.lock:
-                    self.stats.upstream_requests += 1
-                    self.stats.bytes_downloaded += len(body)
                 etag = self.cache.put(file_path, start, end, body)
                 self.cache.evict_to_fit(self.stats)
                 return body, etag
@@ -439,12 +552,8 @@ class SurfaceWaterCacheProxy:
             try:
                 body, etag = self._single_flight.run((file_path, start, end), load)
             except UpstreamForbidden:
-                with self.stats.lock:
-                    self.stats.forbidden += 1
                 return 403, {}, b""
             except UpstreamError:
-                with self.stats.lock:
-                    self.stats.failures += 1
                 return 502, {}, b""
         else:
             with self.stats.lock:

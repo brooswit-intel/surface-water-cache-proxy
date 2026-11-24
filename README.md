@@ -11,18 +11,44 @@ Endpoint inventory below was read from that exact tag (`SurfaceWaterSource.java`
 
 ## Status
 
-`brooswit-intel/surface-water-cache-proxy` does not exist yet (confirmed by a
-fresh read-only check and by Wroosbit's source→issue→repo→owner matrix on
-MINECRAFT-571). Tayne owns creating it and granting this agent's GitHub
-account (`booswrit`) repo-only Write. This tree is ready to push verbatim once
-that lands; work continues locally in the meantime.
+Pushed to `brooswit-intel/surface-water-cache-proxy` main. Reviewed once
+(CHANGES_REQUESTED on 3 findings: health-check false-positive on 403/404,
+unvalidated upstream origin, incomplete observability); all 3 addressed below
+and awaiting re-review.
 
 ## Run
 
 ```
-python3 -m unittest test_proxy -v     # 20 tests, local mock upstream only
+python3 -m unittest test_proxy -v     # 32 tests, local mock upstream only
 python3 proxy.py                      # serves on 127.0.0.1:8075 by default
 ```
+
+## Fixed HTTPS allowlisted origin
+
+`SURFACE_WATER_CACHE_UPSTREAM`, when read from the environment (the
+production-config path `run_server`/`__main__` use), is validated against the
+exact approved origin before use: scheme must be `https`, host must be
+exactly `storage.googleapis.com` with no port, no userinfo, and the path must
+start with `/global-surface-water/downloads2021/occurrence/`. Anything else
+raises `ValueError` at startup rather than silently proxying to an arbitrary
+or private destination. Passing `upstream_base` directly to the constructor
+(what every test does, to point at a local loopback mock) deliberately
+bypasses this check — that is the test-only injection path, never how a real
+deployment's config is read.
+
+## Health check: dedicated TTL-0 probe, exact-success-only
+
+`GET /__health` is a separate, TTL-0 endpoint, independent of the TTL -1 data
+cache below: a fresh live probe on every call, never reading or writing the
+data cache, never incrementing any `upstream_*`/`cache_*` counter (its own
+`health_checks_total/healthy/unhealthy` counters are tracked separately).
+It issues a `bytes=0-7` range request against a fixed representative file
+(`DEFAULT_HEALTH_CHECK_FILE`, independently confirmed present upstream) -
+not the bare base path, which isn't itself a real resource and would 403 on
+a listing-disabled bucket, telling the probe nothing. **Healthy means exactly
+HTTP 206 with a body matching the requested range** — a 403, 404, 5xx, any
+other status, a mismatched/short body, or a connection failure are all
+unhealthy, so a wrong route or an access rejection is never reported green.
 
 ## Cache lifetime (per John's 2026-11-24 decision on MINECRAFT-571, applies to every source lane)
 
@@ -31,9 +57,6 @@ as a successful response, it is served from SQLite regardless of elapsed
 wall-clock time (verified by a test that advances the clock a year between
 write and read-back). This is not the same as immutable:
 
-- `GET /__health` is a separate, TTL-0 endpoint: a fresh live reachability
-  probe (`bytes=0-0` against the upstream base) on every call, never reading
-  or writing the data cache.
 - `POST /__invalidate[?path=<file>]` explicitly clears one file's cached
   ranges, or the whole cache when `path` is omitted - the escape hatch for a
   dataset revision, since nothing expires on its own.
@@ -41,6 +64,21 @@ write and read-back). This is not the same as immutable:
   permanent cache in the first place (unchanged from before this decision);
   only a genuine 404 is cached, as a distinct "missing" sentinel.
 - Byte caps/LRU eviction still bound disk usage despite no time expiry.
+
+## Observability
+
+`GET /__stats` reports, distinct from each other:
+- `cache_hits`/`cache_misses`/`not_modified`/`evictions`/`missing_files`: the
+  data-cache side.
+- `upstream_attempts`/`upstream_fills`/`upstream_missing`/`upstream_forbidden`/
+  `upstream_failed`/`upstream_bytes`/`upstream_latency_ms_total`: **every**
+  real HTTP attempt made to upstream, by outcome, not just the ones that end
+  in a successful fill — a retried 5xx, a truncated transfer, a
+  Content-Range mismatch and a 403/404 are each one counted attempt, with
+  their own bytes-received and latency.
+- `health_checks_total`/`health_checks_healthy`/`health_checks_unhealthy`:
+  the `/__health` probe's own counters, which never move any of the fields
+  above.
 
 ## Upstream contract (from SurfaceWaterSource.java)
 
