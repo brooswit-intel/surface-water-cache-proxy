@@ -243,6 +243,24 @@ class UpstreamForbidden(Exception):
     """Raised for a 403: may be a terms/auth problem, not genuine absence - never cached."""
 
 
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
+
+
+def _content_range_matches(header: str | None, start: int, end: int) -> bool:
+    """A 206 is only trustworthy if its Content-Range proves the server actually
+    answered the exact requested extent - matching body length alone is not
+    enough: a misbehaving/misconfigured origin (or an intermediary) could return
+    the right number of bytes from the WRONG offset, which would then be cached
+    and served back as if it were the requested block (silent data corruption)."""
+    if header is None:
+        return False
+    match = _CONTENT_RANGE_RE.match(header)
+    if match is None:
+        return False
+    got_start, got_end = int(match.group(1)), int(match.group(2))
+    return got_start == start and got_end == end
+
+
 def fetch_upstream_range(upstream_base: str, file_path: str, start: int, end: int,
                           timeout: float = 15.0, retries: int = 3) -> bytes:
     """Byte-range GET against the allowlisted upstream, matching RangeFiles.transfer():
@@ -281,6 +299,12 @@ def fetch_upstream_range(upstream_base: str, file_path: str, start: int, end: in
             if declared is not None and int(declared) != len(body):
                 last_exc = UpstreamError(
                     f"truncated transfer for {full_path}: declared {declared}, got {len(body)}"
+                )
+                continue
+            if resp.status == 206 and not _content_range_matches(resp.getheader("Content-Range"), start, end):
+                last_exc = UpstreamError(
+                    f"Content-Range mismatch for {full_path}: wanted bytes {start}-{end}, "
+                    f"got {resp.getheader('Content-Range')!r}"
                 )
                 continue
             if resp.status == 200 and (start != 0 or len(body) > want):

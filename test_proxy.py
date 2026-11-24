@@ -17,6 +17,7 @@ class _FakeUpstream(http.server.BaseHTTPRequestHandler):
     FORBIDDEN: set[str] = set()
     DROP_ONCE: set[str] = set()  # paths whose very first request gets a dropped connection
     TRUNCATE: set[str] = set()  # paths whose response lies about Content-Length
+    WRONG_RANGE: set[str] = set()  # paths whose Content-Range lies about which bytes these are
     requests: list[tuple[str, str]] = []
 
     def log_message(self, fmt, *args):
@@ -49,8 +50,13 @@ class _FakeUpstream(http.server.BaseHTTPRequestHandler):
             start, end = int(s), int(e)
         chunk = body[start:end + 1]
         declared = len(chunk) - 1 if path in type(self).TRUNCATE else len(chunk)
+        content_range_start, content_range_end = (start, end)
+        if path in type(self).WRONG_RANGE:
+            # Misbehaving/misconfigured origin: the right byte count, from the WRONG offset.
+            content_range_start, content_range_end = start + 1000, end + 1000
         self.send_response(206)
         self.send_header("Content-Length", str(declared))
+        self.send_header("Content-Range", f"bytes {content_range_start}-{content_range_end}/{len(body)}")
         self.end_headers()
         self.wfile.write(chunk)
 
@@ -61,6 +67,7 @@ class ProxyTest(unittest.TestCase):
         _FakeUpstream.FORBIDDEN = set()
         _FakeUpstream.DROP_ONCE = set()
         _FakeUpstream.TRUNCATE = set()
+        _FakeUpstream.WRONG_RANGE = set()
         _FakeUpstream.requests = []
         self.upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FakeUpstream)
         self.upstream_thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
@@ -181,6 +188,27 @@ class ProxyTest(unittest.TestCase):
         status2, _, body2 = self.proxy.serve_range("/" + self.FILE, "bytes=0-7", None)
         self.assertEqual(status2, 206)
         self.assertEqual(body2, b"12345678")
+
+    def test_wrong_content_range_is_never_cached_as_success(self):
+        # A misbehaving/misconfigured origin can return the right number of bytes
+        # from the WRONG offset in a 206. Content-Length matching alone can't
+        # catch this - only validating Content-Range against the exact requested
+        # start/end can. If this were cached, a later request for the real range
+        # would silently be served the wrong file's bytes.
+        body = bytes(range(256)) * 8
+        _FakeUpstream.FILES[self.FILE] = body
+        _FakeUpstream.WRONG_RANGE.add(self.FILE)
+        status, _, _ = self.proxy.serve_range("/" + self.FILE, "bytes=0-7", None)
+        self.assertEqual(status, 502)
+        self.assertEqual(self.proxy.stats.as_dict()["cache_hits"], 0)
+        self.assertEqual(self.proxy.stats.as_dict()["cache_misses"], 1)
+        self.assertEqual(self.proxy.stats.as_dict()["upstream_requests"], 0, "a Content-Range mismatch must never count as a successful upstream fill")
+
+        # Fixing the upstream must succeed on the very next read - nothing wrong was cached.
+        _FakeUpstream.WRONG_RANGE.discard(self.FILE)
+        status2, _, body2 = self.proxy.serve_range("/" + self.FILE, "bytes=0-7", None)
+        self.assertEqual(status2, 206)
+        self.assertEqual(body2, body[0:8])
 
     def test_concurrent_miss_is_deduplicated_single_flight(self):
         body = b"x" * 64
