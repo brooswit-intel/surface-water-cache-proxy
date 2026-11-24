@@ -282,6 +282,36 @@ class ProxyTest(unittest.TestCase):
         after = self.proxy.stats.as_dict()
         self.assertEqual(before, after, "health check must not touch cache_hits/misses or upstream counters")
 
+    def test_warm_tile_serves_from_cache_while_health_reports_upstream_down_then_recovers(self):
+        # John's acceptance requirement (MINECRAFT-571 comment 55734): warm the
+        # ordinary cache, make upstream unavailable, verify the cached read still
+        # hits SQLite while the separate health endpoint truthfully reports the
+        # outage - then restore upstream and confirm a fresh probe succeeds.
+        body = b"warmed-before-outage"
+        _FakeUpstream.FILES[self.FILE] = body
+        status, _, chunk = self.proxy.serve_range("/" + self.FILE, f"bytes=0-{len(body) - 1}", None)
+        self.assertEqual(status, 206)
+        self.assertEqual(chunk, body)
+
+        self.upstream.shutdown()
+        self.upstream.server_close()
+
+        _FakeUpstream.requests.clear()
+        status2, _, chunk2 = self.proxy.serve_range("/" + self.FILE, f"bytes=0-{len(body) - 1}", None)
+        self.assertEqual(status2, 206, "a warm tile must still be served from SQLite while upstream is down")
+        self.assertEqual(chunk2, body)
+        self.assertEqual(len(_FakeUpstream.requests), 0)
+
+        ok, detail = self.proxy.health_check()
+        self.assertFalse(ok, "health must truthfully report the outage, never substitute a stale success")
+
+        # Restart upstream on the same address and confirm a fresh probe recovers.
+        self.upstream = http.server.ThreadingHTTPServer(self.upstream.server_address, _FakeUpstream)
+        self.upstream_thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
+        self.upstream_thread.start()
+        ok2, detail2 = self.proxy.health_check()
+        self.assertTrue(ok2, detail2)
+
     def test_health_check_reports_unreachable_host(self):
         unreachable = sw.SurfaceWaterCacheProxy(
             self.db_path + ".unreachable", upstream_base="http://127.0.0.1:1/", max_bytes=1024
