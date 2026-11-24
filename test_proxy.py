@@ -131,6 +131,27 @@ class ProxyTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 sw.SurfaceWaterCacheProxy(self.db_path + ".bad4")
 
+    def test_production_upstream_rejects_child_path_under_the_real_base(self):
+        # A startswith() prefix check would wrongly accept this - it shares the
+        # approved base path as a prefix, but it is really a different resource
+        # under the same bucket (MINECRAFT-573 review finding).
+        bad = "https://storage.googleapis.com/global-surface-water/downloads2021/occurrence/alternate/"
+        with mock.patch.dict(os.environ, {"SURFACE_WATER_CACHE_UPSTREAM": bad}):
+            with self.assertRaises(ValueError):
+                sw.SurfaceWaterCacheProxy(self.db_path + ".bad5")
+
+    def test_production_upstream_rejects_query_string(self):
+        bad = sw.DEFAULT_UPSTREAM + "?x=1"
+        with mock.patch.dict(os.environ, {"SURFACE_WATER_CACHE_UPSTREAM": bad}):
+            with self.assertRaises(ValueError):
+                sw.SurfaceWaterCacheProxy(self.db_path + ".bad6")
+
+    def test_production_upstream_rejects_fragment(self):
+        bad = sw.DEFAULT_UPSTREAM + "#frag"
+        with mock.patch.dict(os.environ, {"SURFACE_WATER_CACHE_UPSTREAM": bad}):
+            with self.assertRaises(ValueError):
+                sw.SurfaceWaterCacheProxy(self.db_path + ".bad7")
+
     def test_direct_constructor_injection_bypasses_production_validation(self):
         # This is exactly what every other test in this file relies on: a local
         # loopback mock passed directly as upstream_base, never through the

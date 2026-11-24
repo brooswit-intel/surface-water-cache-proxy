@@ -49,7 +49,7 @@ ATTRIBUTION = (
 # The fixed, allowlisted origin: exactly scheme+host+base path, nothing else.
 _ALLOWED_SCHEME = "https"
 _ALLOWED_HOST = "storage.googleapis.com"
-_ALLOWED_PATH_PREFIX = "/global-surface-water/downloads2021/occurrence/"
+_ALLOWED_BASE_PATH = "/global-surface-water/downloads2021/occurrence/"
 
 # A representative file independently confirmed present upstream (read-only
 # bytes=0-7 probe against the real bucket, 2026-11-24, HTTP 206) - used as the
@@ -62,7 +62,13 @@ def _validate_production_upstream(url: str) -> str:
     """Enforces the fixed-HTTPS-allowlisted-origin requirement on the upstream
     actually used in production (read from SURFACE_WATER_CACHE_UPSTREAM). Direct
     constructor injection of upstream_base is test-only and bypasses this check
-    on purpose, so unit tests can still point at a local loopback mock."""
+    on purpose, so unit tests can still point at a local loopback mock.
+
+    The path is matched EXACTLY against the approved base path, not merely as a
+    startswith() prefix: a prefix check would let a child path like
+    '.../occurrence/alternate/' pass, which still changes the real resource the
+    proxy fetches from (MINECRAFT-573 review finding). Query strings and
+    fragments are rejected outright - this origin takes none."""
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != _ALLOWED_SCHEME:
         raise ValueError(f"Surface water upstream must be {_ALLOWED_SCHEME}://, got {parsed.scheme!r} in {url!r}")
@@ -70,8 +76,10 @@ def _validate_production_upstream(url: str) -> str:
         raise ValueError(f"Surface water upstream must not carry userinfo: {url!r}")
     if parsed.hostname != _ALLOWED_HOST or parsed.port is not None:
         raise ValueError(f"Surface water upstream host must be exactly {_ALLOWED_HOST}, got {url!r}")
-    if not parsed.path.startswith(_ALLOWED_PATH_PREFIX):
-        raise ValueError(f"Surface water upstream path must start with {_ALLOWED_PATH_PREFIX!r}, got {url!r}")
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"Surface water upstream must not carry a query or fragment: {url!r}")
+    if parsed.path != _ALLOWED_BASE_PATH:
+        raise ValueError(f"Surface water upstream path must be exactly {_ALLOWED_BASE_PATH!r}, got {url!r}")
     return url
 
 # occurrence_{lon}{E|W}_{lat}{N|S}v1_4_2021.tif - matches SurfaceWaterSource.name().

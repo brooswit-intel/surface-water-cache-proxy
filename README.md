@@ -19,7 +19,7 @@ and awaiting re-review.
 ## Run
 
 ```
-python3 -m unittest test_proxy -v     # 32 tests, local mock upstream only
+python3 -m unittest test_proxy -v     # 35 tests, local mock upstream only
 python3 proxy.py                      # serves on 127.0.0.1:8075 by default
 ```
 
@@ -28,11 +28,15 @@ python3 proxy.py                      # serves on 127.0.0.1:8075 by default
 `SURFACE_WATER_CACHE_UPSTREAM`, when read from the environment (the
 production-config path `run_server`/`__main__` use), is validated against the
 exact approved origin before use: scheme must be `https`, host must be
-exactly `storage.googleapis.com` with no port, no userinfo, and the path must
-start with `/global-surface-water/downloads2021/occurrence/`. Anything else
-raises `ValueError` at startup rather than silently proxying to an arbitrary
-or private destination. Passing `upstream_base` directly to the constructor
-(what every test does, to point at a local loopback mock) deliberately
+exactly `storage.googleapis.com` with no port, no userinfo, no query string or
+fragment, and the path must be **exactly**
+`/global-surface-water/downloads2021/occurrence/` — not merely a `startswith()`
+prefix match, which would wrongly accept a child path like `.../occurrence/
+alternate/` that still points at a different real resource under the same
+bucket. Anything else raises `ValueError` at startup rather than silently
+proxying to an arbitrary or private destination. Passing `upstream_base`
+directly to the constructor (what every test does, to point at a local
+loopback mock) deliberately
 bypasses this check — that is the test-only injection path, never how a real
 deployment's config is read.
 
